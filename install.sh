@@ -92,7 +92,9 @@ if ! python3 -c "import playwright; import aiohttp; import rich" 2>/dev/null; th
     
     # Use pip with --user flag for reliable system-wide install
     echo "   Installing packages..."
-    python3 -m pip install --user --quiet playwright aiohttp rich 2>/dev/null || python3 -m pip install --user playwright aiohttp rich
+    python3 -m pip install --user --break-system-packages --quiet playwright aiohttp rich 2>/dev/null || \
+    python3 -m pip install --user --quiet playwright aiohttp rich 2>/dev/null || \
+    python3 -m pip install --user playwright aiohttp rich
     
     echo ""
     echo "🌐 Installing Playwright browser..."
