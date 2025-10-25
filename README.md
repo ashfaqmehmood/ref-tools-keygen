@@ -8,18 +8,25 @@ A fast, automated script that generates API keys for [ref.tools](https://ref.too
 
 ## ⚡ Quick Start (One Command)
 
-**Run instantly without installing (auto-cleanup included):**
+### 🧩 macOS & Linux (One Command)
 
 ```bash
 bash <(curl -sSL https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/install.sh)
 ```
 
+### 🪟 Windows (PowerShell)
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/install.ps1 | iex
+```
+
 **What happens:**
-1. ✅ Checks Python version (3.10+ required)
-2. ✅ Installs dependencies (playwright, aiohttp, rich)
-3. ✅ Downloads and runs the script
-4. ✅ Generates your API key
-5. ✅ **Automatically cleans everything** (packages, cache, browsers, temp files)
+1. ✅ Checks Python version (3.8+ required)
+2. ✅ Creates isolated virtualenv in temp directory
+3. ✅ Installs dependencies (playwright, aiohttp, rich)
+4. ✅ Downloads Chromium browser (isolated)
+5. ✅ Generates your API key
+6. ✅ **Automatically cleans everything** (venv, packages, browsers, temp files)
 
 **No traces left behind!** Perfect for one-time use. 🧹
 
@@ -37,29 +44,53 @@ python3 get_ref_key.py
 
 - 🚀 **Fully Automated** - No manual steps required
 - 🧹 **Auto-Cleanup** - Removes all dependencies, cache, and traces after run
-- 📧 **Temporary Email** - Uses Guerrilla Mail API
+- �️ **Cross-Platform** - Works on macOS, Linux, and Windows
+- 🔒 **Isolated Environment** - Uses temp virtualenv, doesn't affect your system
+- �📧 **Temporary Email** - Uses Guerrilla Mail API
 - 🔐 **Secure** - Generates strong random passwords
 - 🌐 **Proxy Support** - Optional proxy rotation (set `USE_PROXY=1`)
 - 🎨 **Beautiful UI** - Rich terminal interface
 - ⚡ **Fast** - Async operations for speed
 - 🐛 **Debug Mode** - Detailed logging (`DEBUG=1`)
 - 🗑️ **Zero Traces** - Completely cleans up after execution
+- 🐍 **Self-Bootstrapping** - Installs its own dependencies automatically
 
 ## 🎮 Usage Options
 
 **One-time use with auto-cleanup (recommended):**
+
 ```bash
+# macOS/Linux
 bash <(curl -sSL https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/install.sh)
+
+# Windows
+iwr -useb https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/install.ps1 | iex
 ```
 
-**Keep files after running (skip cleanup):**
+### 🔍 Optional Environment Flags
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `DEBUG=1` | Enables detailed logs & screenshots | `DEBUG=1 bash <(curl -sSL ...)` |
+| `USE_PROXY=1` | Enable proxy rotation | `USE_PROXY=1 bash <(curl -sSL ...)` |
+| `KEEP_FILES=1` | Retain files after completion | `KEEP_FILES=1 bash <(curl -sSL ...)` |
+
+**Examples:**
+
 ```bash
+# macOS/Linux with proxy support
+USE_PROXY=1 bash <(curl -sSL https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/install.sh)
+
+# Windows with debug mode
+$env:DEBUG="1"; iwr -useb https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/install.ps1 | iex
+
+# Keep files for inspection (won't auto-cleanup)
 KEEP_FILES=1 bash <(curl -sSL https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/install.sh)
 ```
 
 **If you downloaded the script manually:**
 ```bash
-# Basic usage
+# Basic usage (self-bootstrapping)
 python3 get_ref_key.py
 
 # With proxy support
@@ -71,8 +102,8 @@ DEBUG=1 python3 get_ref_key.py
 
 ## 📦 Requirements
 
-- Python 3.10+
-- `playwright`, `aiohttp`, `rich` (auto-installed above)
+- Python 3.8+
+- `playwright`, `aiohttp`, `rich` (auto-installed in isolated venv)
 
 ## 🎯 Output Example
 
@@ -112,12 +143,12 @@ DEBUG=1 python3 get_ref_key.py
 ## 🧹 What Gets Cleaned Up
 
 The one-command installer automatically removes:
+- ✅ Isolated virtual environment (created in temp)
 - ✅ Downloaded script files
 - ✅ Installed Python packages (playwright, aiohttp, rich)
-- ✅ Playwright browser binaries (~400MB)
-- ✅ pip cache
+- ✅ Playwright browser binaries (~400MB, isolated in temp)
 - ✅ Python `__pycache__` directories
-- ✅ Temporary directories
+- ✅ All temporary directories
 
 **Result:** Your system is left exactly as it was before running the command! 🎯
 
