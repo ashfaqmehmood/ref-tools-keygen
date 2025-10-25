@@ -29,12 +29,12 @@ cleanup() {
     # Uninstall packages (only if we installed them)
     if [ "$INSTALLED_DEPS" = "true" ]; then
         echo "   Removing installed packages..."
-        pip uninstall -y playwright aiohttp rich 2>/dev/null || true
+        python3 -m pip uninstall -y playwright aiohttp rich 2>/dev/null || true
     fi
     
     # Clear pip cache
     echo "   Clearing pip cache..."
-    pip cache purge 2>/dev/null || true
+    python3 -m pip cache purge 2>/dev/null || true
     
     # Remove Playwright browsers
     echo "   Removing Playwright browsers..."
@@ -90,12 +90,9 @@ if ! python3 -c "import playwright; import aiohttp; import rich" 2>/dev/null; th
         export PATH=$(echo "$PATH" | sed -e 's|[^:]*\.venv[^:]*:||g' -e 's|:$||')
     fi
     
-    if command -v uv &> /dev/null; then
-        echo "   Using uv (faster installation)"
-        uv pip install --system playwright aiohttp rich --quiet 2>/dev/null || pip install --user playwright aiohttp rich --quiet
-    else
-        pip install --user playwright aiohttp rich --quiet
-    fi
+    # Use pip with --user flag for reliable system-wide install
+    echo "   Installing packages..."
+    python3 -m pip install --user --quiet playwright aiohttp rich 2>/dev/null || python3 -m pip install --user playwright aiohttp rich
     
     echo ""
     echo "🌐 Installing Playwright browser..."
