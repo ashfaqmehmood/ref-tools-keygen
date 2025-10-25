@@ -92,7 +92,7 @@ if ! python3 -c "import playwright; import aiohttp; import rich" 2>/dev/null; th
     
     if command -v uv &> /dev/null; then
         echo "   Using uv (faster installation)"
-        uv pip install --python python3 --system playwright aiohttp rich --quiet 2>/dev/null || pip install playwright aiohttp rich --quiet
+        uv pip install --system playwright aiohttp rich --quiet 2>/dev/null || pip install --user playwright aiohttp rich --quiet
     else
         pip install --user playwright aiohttp rich --quiet
     fi
