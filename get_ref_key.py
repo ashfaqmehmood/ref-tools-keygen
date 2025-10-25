@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
 """
-ref.tools API Key Generator
-An automated tool for generating API keys from ref.tools using temporary email addresses.
+ref.tools API Key Generator (self-bootstrapping, cross-platform, zero-trace)
 
-Run directly without cloning:
-    curl -sSL https://raw.githubusercontent.com/yourusername/ref-tools-keygen/main/get_ref_key.py | python3 -
+Usage (macOS/Linux):
+  curl -sSL https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/get_ref_key.py | python3 -
 
-Or download and run:
-    curl -O https://raw.githubusercontent.com/yourusername/ref-tools-keygen/main/get_ref_key.py
-    python3 get_ref_key.py
+Usage (Windows PowerShell):
+  iwr -useb https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/get_ref_key.py | py -3 -
 
-First time setup:
-    pip install playwright aiohttp rich && playwright install chromium
+Behavior:
+- Creates an isolated temp directory and virtualenv
+- Installs playwright, aiohttp, rich into that venv
+- Installs Chromium browser into the temp directory (PLAYWRIGHT_BROWSERS_PATH)
+- Runs the signup/verification/key extraction flow
+- Prints the API key and credentials
+- Schedules a background cleanup to remove ALL temp files (venv, browsers, pycache)
+- Set KEEP_FILES=1 to keep files for debugging
+
+Notes:
+- Requires Python 3.8+ (wider support than 3.10)
+- Proxy support: set USE_PROXY=1
+- Debug mode: set DEBUG=1 (writes debug artifacts to temp/debug)
 """
+
+from __future__ import annotations
 
 import asyncio
 import os
@@ -21,109 +32,271 @@ import secrets
 import string
 import random
 import sys
+import tempfile
+import subprocess
+import shutil
+import platform
+import time
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-try:
-    import aiohttp
-    from playwright.async_api import async_playwright, Browser, BrowserContext, Page
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
-    from rich.table import Table
-    from rich import box
-except ImportError as e:
-    print("\n⚠️  Missing dependencies. Please install them first:\n")
-    print("    pip install playwright aiohttp rich")
-    print("    playwright install chromium")
-    print("\nOr with uv (faster):")
-    print("    pip install uv")
-    print("    uv pip install playwright aiohttp rich")
-    print("    playwright install chromium\n")
-    sys.exit(1)
+# ------------------------------ Config ---------------------------------
 
-# Initialize Rich console
-console = Console()
+REQUIRED_PYTHON = (3, 8)
+PKGS = ["playwright>=1.50.0", "aiohttp>=3.11.0", "rich>=13.9.0"]
+BROWSER_CHANNEL = "chromium"  # playwright install chromium
+EMAIL_CHECK_INTERVAL = 3
+MAX_EMAIL_WAIT_TIME = 120
+SIGNUP_MAX_RETRIES = 3
+SIGNUP_RETRY_DELAY = 5
+MAX_PROXY_RETRIES = 5
 
-# Debug mode - set via environment variable or command line
-DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
-USE_PROXY = os.environ.get("USE_PROXY", "").lower() in ("1", "true", "yes")
-
-# Constants
 GUERRILLA_MAIL_API = "https://api.guerrillamail.com/ajax.php"
 REF_TOOLS_SIGNUP = "https://ref.tools/signup"
 REF_TOOLS_DASHBOARD = "https://ref.tools/dashboard"
 REF_TOOLS_KEYS = "https://ref.tools/keys"
-EMAIL_CHECK_INTERVAL = 3  # seconds
-MAX_EMAIL_WAIT_TIME = 120  # seconds
-SIGNUP_MAX_RETRIES = 3
-SIGNUP_RETRY_DELAY = 5  # seconds
+
 PROXY_LIST_URLS = [
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
 ]
-MAX_PROXY_RETRIES = 5
+
+# Respect user-provided envs
+DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
+USE_PROXY = os.environ.get("USE_PROXY", "").lower() in ("1", "true", "yes")
+KEEP_FILES = os.environ.get("KEEP_FILES", "").lower() in ("1", "true", "yes")
+
+# Globals that will be filled after bootstrap
+console = None  # rich.console.Console
+box = None
+aiohttp = None
+async_playwright = None
+Browser = None
+BrowserContext = None
+Page = None
+
+# --------------------------- Bootstrap layer ---------------------------
+
+
+def ensure_python_version():
+    if sys.version_info < REQUIRED_PYTHON:
+        v = ".".join(map(str, REQUIRED_PYTHON))
+        print(f"❌ Python {v}+ required (found {sys.version.split()[0]})")
+        sys.exit(1)
+
+
+def make_temp_root() -> Path:
+    # Use RTK_TEMP_ROOT if provided (installers can control location)
+    root = os.environ.get("RTK_TEMP_ROOT")
+    if root:
+        p = Path(root).resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    return Path(tempfile.mkdtemp(prefix="refkeygen_")).resolve()
+
+
+def venv_paths(venv_dir: Path) -> Dict[str, Path]:
+    if platform.system().lower().startswith("win"):
+        py = venv_dir / "Scripts" / "python.exe"
+        pip = venv_dir / "Scripts" / "pip.exe"
+        bin_dir = venv_dir / "Scripts"
+        site_packages = venv_dir / "Lib" / "site-packages"
+    else:
+        py = venv_dir / "bin" / "python3"
+        pip = venv_dir / "bin" / "pip"
+        bin_dir = venv_dir / "bin"
+        pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        site_packages = venv_dir / "lib" / pyver / "site-packages"
+    return {
+        "python": py,
+        "pip": pip,
+        "bin_dir": bin_dir,
+        "site_packages": site_packages,
+    }
+
+
+def run_cmd(cmd: List[str], env: Optional[Dict[str, str]] = None):
+    result = subprocess.run(cmd, env=env, check=True)
+    return result.returncode
+
+
+def bootstrap(temp_root: Path) -> Dict[str, Path]:
+    """
+    Create an ephemeral venv and install dependencies + browser into temp_root.
+    Returns a dict with useful paths.
+    """
+    venv_dir = temp_root / "venv"
+    venv_dir.mkdir(parents=True, exist_ok=True)
+    # Avoid pip caches touching global dirs
+    env = os.environ.copy()
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    env["PIP_NO_CACHE_DIR"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PLAYWRIGHT_BROWSERS_PATH"] = str(temp_root / "pw-browsers")
+    env["PYTHONNOUSERSITE"] = "1"
+
+    # Create venv
+    run_cmd([sys.executable, "-m", "venv", str(venv_dir)], env=env)
+    vp = venv_paths(venv_dir)
+
+    # Install packages into venv
+    pkgs = list(PKGS)
+    try:
+        run_cmd([str(vp["python"]), "-m", "pip", "install", "-q"] + pkgs, env=env)
+    except Exception:
+        # Retry without -q for diagnostics
+        run_cmd([str(vp["python"]), "-m", "pip", "install"] + pkgs, env=env)
+
+    # Install chromium browser into temp_root
+    try:
+        run_cmd(
+            [str(vp["python"]), "-m", "playwright", "install", BROWSER_CHANNEL, "-q"],
+            env=env,
+        )
+    except Exception:
+        run_cmd(
+            [str(vp["python"]), "-m", "playwright", "install", BROWSER_CHANNEL],
+            env=env,
+        )
+
+    # Prepare current process to import from venv without re-exec
+    # Important: we will clean up via a background reaper after exit.
+    os.environ.update(env)
+    # Prepend venv bin to PATH so playwright CLI and other shims are found
+    os.environ["PATH"] = f'{vp["bin_dir"]}{os.pathsep}{os.environ.get("PATH","")}'
+    # Load site-packages from venv
+    if str(vp["site_packages"]) not in sys.path:
+        sys.path.insert(0, str(vp["site_packages"]))
+
+    return {
+        "venv_dir": venv_dir,
+        "browsers_dir": Path(env["PLAYWRIGHT_BROWSERS_PATH"]),
+        "debug_dir": temp_root / "debug",
+        "temp_root": temp_root,
+    }
+
+
+def launch_reaper_later(target_dir: Path):
+    """
+    Launch a tiny background process that removes target_dir after this
+    process exits. Retries for a while to handle Windows file locks.
+    """
+    if KEEP_FILES:
+        return
+    py = sys.executable
+    code = r"""
+import os, shutil, sys, time, stat
+from pathlib import Path
+
+def onerror(func, path, exc_info):
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass
+
+def rm_tree(p: Path, attempts=120):
+    for i in range(attempts):
+        try:
+            if p.exists():
+                shutil.rmtree(p, onerror=onerror)
+            return
+        except Exception:
+            time.sleep(0.5)
+
+if __name__ == "__main__":
+    p = Path(sys.argv[1])
+    time.sleep(1.0)
+    rm_tree(p)
+"""
+    try:
+        # Start as detached where possible
+        kwargs = {}
+        if platform.system().lower().startswith("win"):
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            kwargs["close_fds"] = True
+            kwargs["stdin"] = subprocess.DEVNULL
+            kwargs["stdout"] = subprocess.DEVNULL
+            kwargs["stderr"] = subprocess.DEVNULL
+        else:
+            kwargs["stdin"] = subprocess.DEVNULL
+            kwargs["stdout"] = subprocess.DEVNULL
+            kwargs["stderr"] = subprocess.DEVNULL
+        subprocess.Popen(
+            [py, "-c", code, str(target_dir)],
+            **kwargs,
+        )
+    except Exception:
+        # Best-effort; ignore if reaper can't start
+        pass
+
+
+def import_third_party():
+    global aiohttp, async_playwright, Browser, BrowserContext, Page, console, box
+    try:
+        import aiohttp as _aiohttp
+        from playwright.async_api import (
+            async_playwright as _async_playwright,
+            Browser as _Browser,
+            BrowserContext as _BrowserContext,
+            Page as _Page,
+        )
+        from rich.console import Console as _Console
+        from rich import box as _box
+
+        aiohttp = _aiohttp
+        async_playwright = _async_playwright
+        Browser = _Browser
+        BrowserContext = _BrowserContext
+        Page = _Page
+        console = _Console()
+        box = _box
+    except Exception as e:
+        print("❌ Failed to import dependencies after bootstrap:", e)
+        sys.exit(1)
 
 
 def debug_log(message: str):
-    """Log debug messages if DEBUG mode is enabled."""
-    if DEBUG:
+    if DEBUG and console:
         console.print(f"[dim cyan][DEBUG][/dim cyan] {message}")
 
 
-async def fetch_proxies() -> List[str]:
-    """
-    Fetch fresh proxy list from GitHub.
-    
-    Returns:
-        List of proxy URLs
-    """
-    proxies = []
-    debug_log("Fetching proxy list from GitHub...")
-    
-    async with aiohttp.ClientSession() as session:
-        for url in PROXY_LIST_URLS:
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status == 200:
-                        text = await response.text()
-                        proxy_list = [line.strip() for line in text.split('\n') if line.strip()]
-                        proxies.extend(proxy_list)
-                        debug_log(f"Fetched {len(proxy_list)} proxies from {url}")
-            except Exception as e:
-                debug_log(f"Failed to fetch proxies from {url}: {e}")
-                continue
-    
-    if proxies:
-        random.shuffle(proxies)
-        debug_log(f"Total proxies available: {len(proxies)}")
-    
-    return proxies
+# ----------------------------- App logic --------------------------------
 
 
 def format_proxy(proxy: str) -> Optional[str]:
-    """
-    Format proxy string to proper URL format.
-    
-    Args:
-        proxy: Proxy in format "ip:port" or "protocol://ip:port"
-        
-    Returns:
-        Formatted proxy URL or None if invalid
-    """
     if not proxy:
         return None
-    
-    # If already has protocol, return as is
-    if proxy.startswith(('http://', 'https://', 'socks4://', 'socks5://')):
+    if proxy.startswith(("http://", "https://", "socks4://", "socks5://")):
         return proxy
-    
-    # Otherwise, assume HTTP
     return f"http://{proxy}"
 
 
-class GuerrillaMailClient:
-    """Asynchronous client for Guerrilla Mail temporary email service."""
+async def fetch_proxies() -> List[str]:
+    proxies: List[str] = []
+    debug_log("Fetching proxy list from GitHub...")
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for url in PROXY_LIST_URLS:
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        text = await resp.text()
+                        lst = [l.strip() for l in text.split("\n") if l.strip()]
+                        proxies.extend(lst)
+                        debug_log(f"Fetched {len(lst)} proxies from {url}")
+            except Exception as e:
+                debug_log(f"Failed to fetch proxies from {url}: {e}")
+                continue
+    if proxies:
+        random.shuffle(proxies)
+        debug_log(f"Total proxies available: {len(proxies)}")
+    return proxies
 
+
+class GuerrillaMailClient:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
         self.email: Optional[str] = None
@@ -131,575 +304,442 @@ class GuerrillaMailClient:
         self.cookies: Optional[Dict[str, str]] = None
 
     async def get_email_address(self) -> str:
-        """
-        Obtain a temporary email address from Guerrilla Mail.
-        Extracts and stores session cookies for subsequent requests.
-        """
-        debug_log("Requesting temporary email from Guerrilla Mail API")
+        debug_log("Requesting temporary email from Guerrilla Mail")
         params = {"f": "get_email_address"}
-        async with self.session.get(GUERRILLA_MAIL_API, params=params) as response:
-            # Extract PHPSESSID cookie for session management
-            if response.cookies:
-                self.cookies = {k: v.value for k, v in response.cookies.items()}
+        async with self.session.get(GUERRILLA_MAIL_API, params=params) as r:
+            if r.cookies:
+                self.cookies = {k: v.value for k, v in r.cookies.items()}
                 debug_log(f"Extracted cookies: {self.cookies}")
-
-            data = await response.json()
+            data = await r.json()
             self.email = data["email_addr"]
             self.sid_token = data["sid_token"]
-            debug_log(f"Received email: {self.email}, sid_token: {self.sid_token}")
+            debug_log(f"Email: {self.email}, sid_token: {self.sid_token}")
             return self.email
 
     async def poll_for_email(self, timeout: int = MAX_EMAIL_WAIT_TIME) -> Optional[str]:
-        """
-        Poll for emails from ref.tools and extract the verification link.
-        
-        Args:
-            timeout: Maximum time to wait for email (seconds)
-            
-        Returns:
-            Verification link URL or None if not found
-        """
-        debug_log(f"Starting email polling with timeout: {timeout}s")
-        params = {
-            "f": "get_email_list",
-            "offset": "0",
-            "sid_token": self.sid_token,
-        }
-
-        start_time = asyncio.get_event_loop().time()
-        poll_count = 0
-
-        while (asyncio.get_event_loop().time() - start_time) < timeout:
-            poll_count += 1
-            debug_log(f"Email poll attempt #{poll_count}")
-            
-            # Add cookies to request if available
-            kwargs = {"params": params}
+        debug_log(f"Polling email (timeout {timeout}s)")
+        params = {"f": "get_email_list", "offset": "0", "sid_token": self.sid_token}
+        start = asyncio.get_event_loop().time()
+        poll = 0
+        while (asyncio.get_event_loop().time() - start) < timeout:
+            poll += 1
+            kwargs: Dict[str, Any] = {"params": params}
             if self.cookies:
                 kwargs["cookies"] = self.cookies
-
-            async with self.session.get(GUERRILLA_MAIL_API, **kwargs) as response:
-                data = await response.json()
-                email_list = data.get("list", [])
-                debug_log(f"Received {len(email_list)} emails")
-
-                # Check for emails from ref.tools
-                for email in email_list:
-                    sender = email.get("mail_from", "").lower()
-                    subject = email.get("mail_subject", "")
-                    debug_log(f"Email from: {sender}, subject: {subject}")
-                    
-                    if "ref" in sender or "verify" in subject.lower():
-                        debug_log(f"Found ref.tools email! mail_id: {email['mail_id']}")
-                        mail_id = email["mail_id"]
-                        verification_link = await self._fetch_email_body(mail_id)
-                        if verification_link:
-                            debug_log(f"Extracted verification link: {verification_link}")
-                            return verification_link
-
+            try:
+                async with self.session.get(GUERRILLA_MAIL_API, **kwargs) as r:
+                    data = await r.json()
+                    emails = data.get("list", [])
+                    debug_log(f"Email poll #{poll}: {len(emails)} emails")
+                    for em in emails:
+                        sender = em.get("mail_from", "").lower()
+                        subject = em.get("mail_subject", "")
+                        if "ref" in sender or "verify" in subject.lower():
+                            mail_id = em["mail_id"]
+                            link = await self._fetch_email_body(mail_id)
+                            if link:
+                                return link
+            except Exception as e:
+                debug_log(f"Poll error: {e}")
             await asyncio.sleep(EMAIL_CHECK_INTERVAL)
-
         debug_log("Email polling timed out")
         return None
 
     async def _fetch_email_body(self, mail_id: str) -> Optional[str]:
-        """
-        Fetch the email body and extract the verification link.
-        
-        Args:
-            mail_id: ID of the email to fetch
-            
-        Returns:
-            Verification link or None
-        """
-        debug_log(f"Fetching email body for mail_id: {mail_id}")
-        params = {
-            "f": "fetch_email",
-            "email_id": mail_id,
-            "sid_token": self.sid_token,
-        }
-
-        kwargs = {"params": params}
+        debug_log(f"Fetching email body id={mail_id}")
+        params = {"f": "fetch_email", "email_id": mail_id, "sid_token": self.sid_token}
+        kwargs: Dict[str, Any] = {"params": params}
         if self.cookies:
             kwargs["cookies"] = self.cookies
-
-        async with self.session.get(GUERRILLA_MAIL_API, **kwargs) as response:
-            data = await response.json()
-            body = data.get("mail_body", "")
-            debug_log(f"Email body length: {len(body)} characters")
-            
+        async with self.session.get(GUERRILLA_MAIL_API, **kwargs) as r:
+            data = await r.json()
+            body = data.get("mail_body", "") or ""
             if DEBUG:
-                debug_log(f"Email body preview: {body[:500]}...")
-
-            # Extract verification link using regex
-            # Look for ref.tools verification or confirm URLs
+                debug_log(f"Email body preview: {body[:400]}...")
             patterns = [
                 r'https?://(?:www\.)?ref\.tools/verify[^\s<>"\']+',
                 r'https?://(?:www\.)?ref\.tools/confirm[^\s<>"\']+',
                 r'https?://(?:www\.)?ref\.tools/[^\s<>"\']*verify[^\s<>"\']*',
                 r'https?://(?:www\.)?ref\.tools/[^\s<>"\']*confirm[^\s<>"\']*',
             ]
-
-            for pattern in patterns:
-                match = re.search(pattern, body)
-                if match:
-                    debug_log(f"Matched pattern: {pattern}")
-                    return match.group(0)
-
-            debug_log("No verification link found in email body")
-
+            for pat in patterns:
+                m = re.search(pat, body)
+                if m:
+                    return m.group(0)
         return None
 
 
 class RefToolsAutomation:
-    """Asynchronous browser automation for ref.tools signup and key extraction."""
-
-    def __init__(self, browser: Browser, proxy: Optional[str] = None):
+    def __init__(self, browser: Browser, debug_dir: Path, proxy: Optional[str] = None):
         self.browser = browser
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
-        self.password: str = self._generate_password()
+        self.password: str = self._gen_password()
         self.proxy = proxy
+        self.debug_dir = debug_dir
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def _generate_password(length: int = 16) -> str:
-        """Generate a cryptographically secure random password."""
+    def _gen_password(length: int = 16) -> str:
         alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
         return "".join(secrets.choice(alphabet) for _ in range(length))
 
     async def initialize(self):
-        """Create a new browser context and page with optional proxy."""
-        context_options = {
-            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        context_options: Dict[str, Any] = {
+            "user_agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
         }
-        
-        if self.proxy:
-            formatted_proxy = format_proxy(self.proxy)
-            if formatted_proxy:
-                context_options["proxy"] = {"server": formatted_proxy}
-                debug_log(f"Using proxy: {formatted_proxy}")
-        
         self.context = await self.browser.new_context(**context_options)
         self.page = await self.context.new_page()
 
     async def signup(self, email: str) -> bool:
-        """
-        Perform signup on ref.tools with retry logic.
-        
-        Args:
-            email: Email address to use for signup
-            
-        Returns:
-            True if signup was successful, False otherwise
-        """
         for attempt in range(SIGNUP_MAX_RETRIES):
             try:
                 debug_log(f"Signup attempt {attempt + 1}/{SIGNUP_MAX_RETRIES}")
-                debug_log(f"Navigating to {REF_TOOLS_SIGNUP}")
                 await self.page.goto(REF_TOOLS_SIGNUP, wait_until="networkidle")
-                
                 if DEBUG:
-                    # Take screenshot in debug mode
-                    await self.page.screenshot(path=f"debug_signup_{attempt + 1}.png")
-                    debug_log(f"Screenshot saved: debug_signup_{attempt + 1}.png")
-
-                # Locate and fill email input
-                debug_log("Locating email input field")
+                    p = self.debug_dir / f"debug_signup_{attempt + 1}.png"
+                    await self.page.screenshot(path=str(p))
                 email_input = self.page.locator('input[type="email"]')
                 await email_input.fill(email)
-                debug_log(f"Filled email: {email}")
-
-                # Locate and fill password input - use ID for specificity
-                debug_log("Locating password input field")
-                password_input = self.page.locator('input#password[type="password"]')
-                await password_input.fill(self.password)
-                debug_log("Filled password field")
-
-                # Locate and fill confirm password input
-                debug_log("Locating confirm password input field")
-                confirm_password_input = self.page.locator('input#confirmPassword[type="password"]')
-                await confirm_password_input.fill(self.password)
-                debug_log("Filled confirm password field")
-
-                # Click signup button
-                debug_log("Locating and clicking signup button")
-                signup_button = self.page.locator('button[type="submit"]')
-                await signup_button.click()
-                debug_log("Signup button clicked")
-
-                # Wait for navigation to dashboard (no email verification needed)
-                debug_log("Waiting for redirect to dashboard...")
+                pwd_input = self.page.locator('input#password[type="password"]')
+                await pwd_input.fill(self.password)
+                cfm_input = self.page.locator(
+                    'input#confirmPassword[type="password"]'
+                )
+                await cfm_input.fill(self.password)
+                btn = self.page.locator('button[type="submit"]')
+                await btn.click()
                 try:
-                    # Wait for URL to change to dashboard page
-                    await self.page.wait_for_url("**/dashboard", timeout=10000)
-                    debug_log("Successfully redirected to dashboard")
+                    await self.page.wait_for_url("**/dashboard", timeout=15000)
                 except Exception as e:
-                    debug_log(f"Redirect wait error (continuing anyway): {e}")
-                    await asyncio.sleep(3)  # Fallback wait
-                
-                debug_log("Signup form submitted successfully")
+                    debug_log(f"Redirect wait warning: {e}")
+                    await asyncio.sleep(3)
                 return True
-
             except Exception as e:
-                debug_log(f"Signup attempt {attempt + 1} error: {str(e)}")
+                debug_log(f"Signup error: {e}")
                 if attempt < SIGNUP_MAX_RETRIES - 1:
-                    console.print(
-                        f"[yellow]Signup attempt {attempt + 1} failed, retrying...[/yellow]"
-                    )
+                    if console:
+                        console.print(
+                            f"[yellow]Signup attempt {attempt + 1} "
+                            f"failed, retrying...[/yellow]"
+                        )
                     await asyncio.sleep(SIGNUP_RETRY_DELAY)
-                else:
-                    console.print(f"[red]Signup failed after {SIGNUP_MAX_RETRIES} attempts: {e}[/red]")
-                    return False
-
+        if console:
+            console.print(
+                f"[red]Signup failed after {SIGNUP_MAX_RETRIES} attempts[/red]"
+            )
         return False
 
     async def request_verification_email(self):
-        """Click the 'Send Verification Email' button on the dashboard."""
         try:
-            debug_log("Looking for verification email button")
-            
-            # Wait a bit for the page to fully render
             await asyncio.sleep(2)
-            
-            # Look for the "Send Verification Email" button using multiple selectors
             selectors = [
                 "button.verify-button",
                 ".verification-banner button",
-                "button.verify-button",
+                "button:has-text('Verify')",
+                "button:has-text('Send Verification')",
             ]
-            
-            clicked = False
-            for selector in selectors:
+            for sel in selectors:
                 try:
-                    verify_button = self.page.locator(selector)
-                    count = await verify_button.count()
-                    debug_log(f"Selector '{selector}' found {count} buttons")
-                    
+                    btns = self.page.locator(sel)
+                    count = await btns.count()
                     if count > 0:
-                        # Wait for the button to be visible and clickable
-                        await verify_button.first.wait_for(state="visible", timeout=5000)
-                        await verify_button.first.click()
-                        debug_log(f"✓ Clicked 'Send Verification Email' button using selector: {selector}")
-                        await asyncio.sleep(3)  # Wait for the email to be sent
-                        clicked = True
-                        break
+                        await btns.first.wait_for(state="visible", timeout=5000)
+                        await btns.first.click()
+                        await asyncio.sleep(3)
+                        return
                 except Exception as e:
-                    debug_log(f"Error with selector '{selector}': {e}")
-                    continue
-            
-            if not clicked:
-                debug_log("WARNING: No verification button found - email may already be verified or button not loaded")
-                
+                    debug_log(f"Selector '{sel}' error: {e}")
         except Exception as e:
-            debug_log(f"Error requesting verification email: {e}")
-            # Don't fail here - continue anyway
+            debug_log(f"Verification button error: {e}")
 
-    async def confirm_email(self, verification_link: str):
-        """
-        Navigate to the email verification link.
-        
-        Args:
-            verification_link: URL to verify the email
-        """
-        debug_log(f"Navigating to verification link: {verification_link}")
-        await self.page.goto(verification_link, wait_until="domcontentloaded", timeout=15000)
-        await asyncio.sleep(3)  # Allow time for processing and redirect
-        debug_log("Email confirmation completed")
-        
+    async def confirm_email(self, link: str):
+        await self.page.goto(link, wait_until="domcontentloaded", timeout=20000)
+        await asyncio.sleep(3)
         if DEBUG:
-            await self.page.screenshot(path="debug_after_verification.png")
-            debug_log("Screenshot saved: debug_after_verification.png")
+            p = self.debug_dir / "debug_after_verification.png"
+            await self.page.screenshot(path=str(p))
 
     async def extract_api_key(self) -> Optional[str]:
-        """
-        Navigate to the keys page and extract the API key.
-        
-        Returns:
-            The API key or None if not found
-        """
         try:
-            # Navigate to the keys page
-            debug_log(f"Navigating to {REF_TOOLS_KEYS}")
-            await self.page.goto(REF_TOOLS_KEYS, wait_until="domcontentloaded", timeout=15000)
-            
-            # Wait for page to be fully loaded
-            await asyncio.sleep(3)
-            
+            await self.page.goto(REF_TOOLS_KEYS, wait_until="domcontentloaded")
+            await asyncio.sleep(2)
             if DEBUG:
-                await self.page.screenshot(path="debug_keys_page.png")
-                debug_log("Screenshot saved: debug_keys_page.png")
-                # Also save the HTML for inspection
-                html_content = await self.page.content()
-                with open("debug_keys_page.html", "w", encoding="utf-8") as f:
-                    f.write(html_content)
-                debug_log("HTML saved: debug_keys_page.html")
-
-            # Try multiple selectors to find the API key
-            # Look for elements that specifically contain API key patterns
+                p = self.debug_dir / "debug_keys_page.png"
+                await self.page.screenshot(path=str(p))
+                html = await self.page.content()
+                (self.debug_dir / "debug_keys_page.html").write_text(
+                    html, encoding="utf-8"
+                )
             selectors = [
-                # Look for input fields with readonly attribute (common for API keys)
                 "input[readonly]",
                 "input[type='text'][readonly]",
-                # Look for code elements that contain long alphanumeric strings
+                "textarea[readonly]",
                 "code",
-                # Other possibilities
                 "[data-key]",
                 "pre code",
                 ".api-key",
                 "[class*='key'] code",
-                "textarea[readonly]",
             ]
-
-            # First pass: try to find elements with API key-like content
-            for selector in selectors:
+            for sel in selectors:
                 try:
-                    debug_log(f"Trying selector: {selector}")
-                    elements = self.page.locator(selector)
-                    count = await elements.count()
-                    debug_log(f"Found {count} elements for selector: {selector}")
-                    
-                    # Check each element
+                    els = self.page.locator(sel)
+                    count = await els.count()
                     for i in range(count):
-                        element = elements.nth(i)
-                        
-                        # Try to get the value attribute first (for inputs/textareas)
+                        e = els.nth(i)
                         try:
-                            api_key = await element.get_attribute("value")
-                            if api_key:
-                                debug_log(f"Element {i} value attribute: {api_key[:50]}...")
-                                # Check if it looks like an API key (starts with ref_ or is long alphanumeric)
-                                if (api_key.startswith("ref_") or len(api_key) > 30) and len(api_key) < 200:
-                                    debug_log(f"Valid API key found in value attribute!")
-                                    return api_key.strip()
-                        except:
+                            val = await e.get_attribute("value")
+                            if val and looks_like_key(val):
+                                return val.strip()
+                        except Exception:
                             pass
-                        
-                        # Try inner text
                         try:
-                            api_key = await element.inner_text()
-                            if api_key:
-                                api_key = api_key.strip()
-                                debug_log(f"Element {i} inner text: {api_key[:50]}...")
-                                # Check if it looks like an API key
-                                if api_key.startswith("ref_") or (len(api_key) > 30 and len(api_key) < 200):
-                                    # Make sure it's not just random text
-                                    if not any(word in api_key.lower() for word in ["typescript", "node.js", "error", "failed", "search", "docs", "install", "verify"]):
-                                        debug_log(f"Valid API key found in text content!")
-                                        return api_key
-                        except:
+                            t = (await e.inner_text() or "").strip()
+                            if t and looks_like_key(t):
+                                return t
+                        except Exception:
                             pass
-                            
                 except Exception as e:
-                    debug_log(f"Error with selector {selector}: {e}")
-                    continue
-
-            # If no key found with selectors, try extracting from page text
-            debug_log("Attempting to extract API key from page text")
+                    debug_log(f"Selector error {sel}: {e}")
             page_text = await self.page.inner_text("body")
-            if DEBUG:
-                debug_log(f"Page text preview: {page_text[:500]}...")
-            
-            # Look for patterns that might be API keys (alphanumeric strings of reasonable length)
-            key_pattern = r'\b[A-Za-z0-9_-]{20,}\b'
-            matches = re.findall(key_pattern, page_text)
-            debug_log(f"Found {len(matches)} potential API key patterns")
-            if matches:
-                debug_log(f"Using first match: {matches[0]}")
-                return matches[0]
-
+            m = re.findall(r"\b[A-Za-z0-9_-]{20,}\b", page_text or "")
+            if m:
+                return m[0]
         except Exception as e:
-            console.print(f"[red]Error extracting API key: {e}[/red]")
-            debug_log(f"Exception details: {e}")
-
+            if console:
+                console.print(f"[red]Error extracting API key: {e}[/red]")
         return None
 
     async def close(self):
-        """Clean up browser resources."""
         if self.context:
             await self.context.close()
 
 
-async def main():
-    """Main execution flow for ref.tools API key generation."""
-    # Display banner
-    console.print()
-    console.print(Panel.fit(
-        "[bold bright_cyan]🔑 ref.tools API Key Generator[/bold bright_cyan]\n"
-        "[dim]Automated API key generation using temporary email[/dim]",
-        border_style="bright_cyan",
-        box=box.DOUBLE
-    ))
-    console.print()
-    
-    if DEBUG:
-        console.print("[yellow]🐛 DEBUG MODE ENABLED[/yellow]\n")
+def looks_like_key(s: str) -> bool:
+    if s.startswith("ref_"):
+        return True
+    if 30 <= len(s) <= 200 and re.match(r"^[A-Za-z0-9_\-]+$", s):
+        bad = [
+            "typescript",
+            "node.js",
+            "error",
+            "failed",
+            "search",
+            "docs",
+            "install",
+            "verify",
+        ]
+        return not any(w in s.lower() for w in bad)
+    return False
+
+
+async def run_keygen(temp_dirs: Dict[str, Path]):
+    # Imports are ready here
+    from rich.panel import Panel
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        BarColumn,
+        TimeElapsedColumn,
+    )
+    from rich.table import Table
+
+    debug_log("Starting Playwright")
+    playwright = await async_playwright().start()
+
+    # Proxy must be set on launch, not on context
+    launch_args: Dict[str, Any] = {"headless": not DEBUG}
+    current_proxy: Optional[str] = None
+    proxies: List[str] = []
+
+    if USE_PROXY:
+        if console:
+            console.print("[cyan]📡 Fetching fresh proxy list...[/cyan]")
+        try:
+            proxies = await fetch_proxies()
+            if console:
+                console.print(
+                    f"[green]✓[/green] Loaded [bold]{len(proxies)}[/bold] proxies\n"
+                )
+            if proxies:
+                current_proxy = proxies[0]
+        except Exception as e:
+            debug_log(f"Proxy fetch failed: {e}")
+
+        if current_proxy:
+            fmt = format_proxy(current_proxy)
+            if fmt:
+                launch_args["proxy"] = {"server": fmt}
+                debug_log(f"Using proxy: {fmt}")
 
     browser: Optional[Browser] = None
     session: Optional[aiohttp.ClientSession] = None
-    proxies: List[str] = []
-    current_proxy: Optional[str] = None
-    proxy_attempt = 0
+    api_key: Optional[str] = None
+    email: Optional[str] = None
+    password: Optional[str] = None
 
     try:
-        # Fetch proxies only if enabled
-        if USE_PROXY:
-            with console.status("[cyan]📡 Fetching fresh proxy list...[/cyan]", spinner="dots") as status:
-                proxies = await fetch_proxies()
-            
-            if proxies:
-                console.print(f"[green]✓[/green] Loaded [bold]{len(proxies)}[/bold] proxies\n")
-                current_proxy = proxies[proxy_attempt] if proxy_attempt < len(proxies) else None
-            else:
-                console.print("[yellow]⚠[/yellow] No proxies loaded, continuing without proxy\n")
-        else:
-            debug_log("Proxy mode disabled, running without proxy")
-        
-        # Initialize with progress indicator
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TimeElapsedColumn(),
-            console=console,
-            transient=True
-        ) as progress:
-            task = progress.add_task("[cyan]Initializing browser...", total=None)
-            # Select proxy if available
-            if proxies and proxy_attempt < len(proxies):
-                current_proxy = proxies[proxy_attempt]
-                debug_log(f"Attempting with proxy #{proxy_attempt + 1}")
-            
-            # Launch browser
-            debug_log("Starting Playwright")
-            playwright = await async_playwright().start()
-            browser = await playwright.chromium.launch(headless=not DEBUG)
-            debug_log(f"Browser launched (headless={not DEBUG})")
+        browser = await playwright.chromium.launch(**launch_args)
 
-            # Create HTTP session
-            session = aiohttp.ClientSession()
+        # Create HTTP session
+        session = aiohttp.ClientSession()
 
-            # Initialize clients
-            guerrilla = GuerrillaMailClient(session)
-            ref_tools = RefToolsAutomation(browser, proxy=current_proxy)
-            await ref_tools.initialize()
-            
-            progress.update(task, description="[cyan]Browser ready")
+        # Banner
+        console.print()
+        console.print(
+            Panel.fit(
+                "[bold bright_cyan]🔑 ref.tools API Key Generator[/bold bright_cyan]\n"
+                "[dim]Automated API key generation using temporary email[/dim]",
+                border_style="bright_cyan",
+                box=box.DOUBLE,
+            )
+        )
+        console.print()
+        if DEBUG:
+            console.print("[yellow]🐛 DEBUG MODE ENABLED[/yellow]\n")
+
+        # Initialize automation
+        ref_tools = RefToolsAutomation(
+            browser, debug_dir=temp_dirs["debug_dir"], proxy=current_proxy
+        )
+        await ref_tools.initialize()
 
         # Step 1: Get temporary email
-        with console.status("[cyan]📧 Generating temporary email...[/cyan]", spinner="dots"):
+        with console.status(
+            "[cyan]📧 Generating temporary email...[/cyan]", spinner="dots"
+        ):
+            guerrilla = GuerrillaMailClient(session)
             email = await guerrilla.get_email_address()
-        console.print(f"[green]✓[/green] Email generated: [bold cyan]{email}[/bold cyan]")
+        console.print(
+            f"[green]✓[/green] Email generated: [bold cyan]{email}[/bold cyan]"
+        )
 
-        # Step 2: Sign up on ref.tools
-        with console.status(f"[cyan]📝 Signing up on ref.tools...[/cyan]", spinner="dots"):
-            signup_success = await ref_tools.signup(email)
-
-        if not signup_success:
+        # Step 2: Sign up
+        with console.status(
+            "[cyan]📝 Signing up on ref.tools...[/cyan]", spinner="dots"
+        ):
+            ok = await ref_tools.signup(email)
+        if not ok:
             console.print("[red]✗[/red] Signup failed\n")
-            return
+            password = ref_tools.password
+            return api_key, email, password
 
         console.print("[green]✓[/green] Signup successful")
+        password = ref_tools.password
 
         # Step 3: Request verification email
-        with console.status("[cyan]📬 Requesting verification email...[/cyan]", spinner="dots"):
+        with console.status(
+            "[cyan]📬 Requesting verification email...[/cyan]", spinner="dots"
+        ):
             await ref_tools.request_verification_email()
         console.print("[green]✓[/green] Verification email requested")
 
         # Step 4: Wait for verification email
-        with console.status("[cyan]⏳ Waiting for verification email (max 2 minutes)...[/cyan]", spinner="dots"):
-            verification_link = await guerrilla.poll_for_email()
-
-        if not verification_link:
+        with console.status(
+            "[cyan]⏳ Waiting for verification email (max 2 minutes)...[/cyan]",
+            spinner="dots",
+        ):
+            link = await guerrilla.poll_for_email()
+        if not link:
             console.print("[red]✗[/red] Verification email not received\n")
-            return
+            return api_key, email, password
 
         console.print("[green]✓[/green] Verification email received")
 
         # Step 5: Confirm email
         with console.status("[cyan]✉️  Confirming email...[/cyan]", spinner="dots"):
-            await ref_tools.confirm_email(verification_link)
+            await ref_tools.confirm_email(link)
         console.print("[green]✓[/green] Email confirmed")
 
         # Step 6: Extract API key
         with console.status("[cyan]🔐 Extracting API key...[/cyan]", spinner="dots"):
             api_key = await ref_tools.extract_api_key()
-
         if not api_key:
             console.print("[red]✗[/red] Failed to extract API key\n")
-            console.print("[yellow]Manual access credentials:[/yellow]")
-            console.print(f"  Email: {email}")
-            console.print(f"  Password: {ref_tools.password}\n")
-            return
+            return api_key, email, password
 
-        # Display success with beautiful output
+        # Success output
         console.print()
-        console.print("[green]" + "="*60 + "[/green]")
-        console.print("[bold green]✨ SUCCESS! API Key Generated ✨[/bold green]".center(60))
-        console.print("[green]" + "="*60 + "[/green]")
+        console.print("[green]" + "=" * 60 + "[/green]")
+        console.print(
+            "[bold green]✨ SUCCESS! API Key Generated ✨[/bold green]".center(60)
+        )
+        console.print("[green]" + "=" * 60 + "[/green]")
         console.print()
-        
-        # Create results table
-        table = Table(show_header=False, box=box.ROUNDED, border_style="green", padding=(0, 2))
+
+        table = Table(
+            show_header=False, box=box.ROUNDED, border_style="green", padding=(0, 2)
+        )
         table.add_column("Field", style="bold cyan")
         table.add_column("Value", style="bright_white")
-        
         table.add_row("🔑 API Key", f"[bold green]{api_key}[/bold green]")
-        table.add_row("📧 Email", email)
-        table.add_row("🔒 Password", ref_tools.password)
-        
+        table.add_row("📧 Email", email or "")
+        table.add_row("🔒 Password", password or "")
         console.print(table)
         console.print()
-        
-        # Instructions
-        console.print(Panel(
-            "[bold]How to use your API key:[/bold]\n\n"
-            "1. Add to your MCP client configuration\n"
-            "2. Use in API requests as authentication\n"
-            "3. Keep your credentials safe!\n\n"
-            "[dim]Visit https://ref.tools/keys to manage your keys[/dim]",
-            title="[bold cyan]Next Steps[/bold cyan]",
-            border_style="cyan",
-            box=box.ROUNDED
-        ))
+
+        console.print(
+            Panel(
+                "[bold]How to use your API key:[/bold]\n\n"
+                "1. Add to your MCP client configuration\n"
+                "2. Use in API requests as authentication\n"
+                "3. Keep your credentials safe!\n\n"
+                "[dim]Visit https://ref.tools/keys to manage your keys[/dim]",
+                title="[bold cyan]Next Steps[/bold cyan]",
+                border_style="cyan",
+                box=box.ROUNDED,
+            )
+        )
         console.print()
 
-    except Exception as e:
-        console.print(f"\n[red]✗[/red] An error occurred: [dim]{str(e)}[/dim]\n")
-        
-        # Retry with different proxy if available
-        if proxies and proxy_attempt < MAX_PROXY_RETRIES and proxy_attempt < len(proxies):
-            console.print(f"[yellow]⟳[/yellow] Retrying with different proxy ({proxy_attempt + 1}/{MAX_PROXY_RETRIES})...\n")
-            await asyncio.sleep(2)
-            # Close current browser if exists
-            if browser:
-                try:
-                    await browser.close()
-                except:
-                    pass
-            # Retry without incrementing attempt count yet
-            return await main_with_retry(proxy_attempt + 1, proxies)
-        
-        if DEBUG:
-            raise
-
+        return api_key, email, password
     finally:
-        # Clean up resources
-        if session:
-            try:
+        # Tidy resources
+        try:
+            if session:
                 await session.close()
-            except:
-                pass
-        if browser:
-            try:
+        except Exception:
+            pass
+        try:
+            if browser:
                 await browser.close()
-            except:
-                pass
+        except Exception:
+            pass
+        try:
+            await playwright.stop()
+        except Exception:
+            pass
 
 
-async def main_with_retry(proxy_attempt: int = 0, proxies: Optional[List[str]] = None):
-    """Main function with retry logic."""
-    return await main()
+def main():
+    ensure_python_version()
+
+    # Build temp root and bootstrap env
+    temp_root = make_temp_root()
+    try:
+        env_paths = bootstrap(temp_root)
+        import_third_party()
+
+        # Ensure we do not write debug artifacts in user CWD
+        os.chdir(temp_root)
+
+        # Run
+        api_key, email, password = asyncio.run(run_keygen(env_paths))
+
+        # If failed, print credentials for manual login
+        if not api_key and email and password and console:
+            console.print("[yellow]Manual access credentials:[/yellow]")
+            console.print(f"  Email: {email}")
+            console.print(f"  Password: {password}\n")
+    finally:
+        # Always schedule cleanup unless KEEP_FILES=1
+        launch_reaper_later(temp_root)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
