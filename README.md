@@ -4,54 +4,68 @@
 
 A fast, automated script that generates API keys for [ref.tools](https://ref.tools) using temporary email addresses. No signup hassle, just run and get your key!
 
+**✨ Features:** Fully automated | Auto-cleanup | Zero traces | One command
+
 ## ⚡ Quick Start (One Command)
 
-**Run instantly without installing:**
+**Run instantly without installing (auto-cleanup included):**
 
 ```bash
 bash <(curl -sSL https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/install.sh)
 ```
 
-This will:
-1. Check Python version (3.10+ required)
-2. Install dependencies (playwright, aiohttp, rich)
-3. Download the script
-4. Run it immediately
+**What happens:**
+1. ✅ Checks Python version (3.10+ required)
+2. ✅ Installs dependencies (playwright, aiohttp, rich)
+3. ✅ Downloads and runs the script
+4. ✅ Generates your API key
+5. ✅ **Automatically cleans everything** (packages, cache, browsers, temp files)
 
-### Manual Installation
+**No traces left behind!** Perfect for one-time use. 🧹
 
-If you prefer to install dependencies manually:
+### Manual Installation (Persistent)
+
+If you want to keep the script and run it multiple times:
 
 ```bash
 pip install playwright aiohttp rich && playwright install chromium
-curl -O https://raw.githubusercontent.com/yourusername/ref-tools-keygen/main/get_ref_key.py
+curl -O https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/get_ref_key.py
 python3 get_ref_key.py
 ```
 
 ## ✨ Features
 
 - 🚀 **Fully Automated** - No manual steps required
+- 🧹 **Auto-Cleanup** - Removes all dependencies, cache, and traces after run
 - 📧 **Temporary Email** - Uses Guerrilla Mail API
 - 🔐 **Secure** - Generates strong random passwords
 - 🌐 **Proxy Support** - Optional proxy rotation (set `USE_PROXY=1`)
 - 🎨 **Beautiful UI** - Rich terminal interface
 - ⚡ **Fast** - Async operations for speed
 - 🐛 **Debug Mode** - Detailed logging (`DEBUG=1`)
+- 🗑️ **Zero Traces** - Completely cleans up after execution
 
 ## 🎮 Usage Options
 
-**Basic usage:**
+**One-time use with auto-cleanup (recommended):**
 ```bash
+bash <(curl -sSL https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/install.sh)
+```
+
+**Keep files after running (skip cleanup):**
+```bash
+KEEP_FILES=1 bash <(curl -sSL https://raw.githubusercontent.com/ashfaqmehmood/ref-tools-keygen/main/install.sh)
+```
+
+**If you downloaded the script manually:**
+```bash
+# Basic usage
 python3 get_ref_key.py
-```
 
-**With proxy support:**
-```bash
+# With proxy support
 USE_PROXY=1 python3 get_ref_key.py
-```
 
-**Debug mode (see browser):**
-```bash
+# Debug mode (see browser)
 DEBUG=1 python3 get_ref_key.py
 ```
 
@@ -87,11 +101,25 @@ DEBUG=1 python3 get_ref_key.py
 
 ## 🔧 How It Works
 
-1. Generates temporary email via Guerrilla Mail
-2. Automates ref.tools signup with Playwright
-3. Clicks verification email button
-4. Monitors inbox for verification email
-5. Confirms email and extracts API key
+1. Creates temporary directory for isolated execution
+2. Generates temporary email via Guerrilla Mail
+3. Automates ref.tools signup with Playwright
+4. Clicks verification email button
+5. Monitors inbox for verification email
+6. Confirms email and extracts API key
+7. **Auto-cleanup:** Removes all dependencies, browsers, cache, and temp files
+
+## 🧹 What Gets Cleaned Up
+
+The one-command installer automatically removes:
+- ✅ Downloaded script files
+- ✅ Installed Python packages (playwright, aiohttp, rich)
+- ✅ Playwright browser binaries (~400MB)
+- ✅ pip cache
+- ✅ Python `__pycache__` directories
+- ✅ Temporary directories
+
+**Result:** Your system is left exactly as it was before running the command! 🎯
 
 ## 🌐 Proxy Support
 
