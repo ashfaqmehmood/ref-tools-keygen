@@ -82,16 +82,24 @@ INSTALLED_DEPS="false"
 if ! python3 -c "import playwright; import aiohttp; import rich" 2>/dev/null; then
     INSTALLED_DEPS="true"
     echo "📦 Installing dependencies..."
+    
+    # Deactivate any active virtual environment
+    if [ -n "$VIRTUAL_ENV" ]; then
+        echo "   Deactivating existing virtual environment..."
+        unset VIRTUAL_ENV
+        export PATH=$(echo "$PATH" | sed -e 's|[^:]*\.venv[^:]*:||g' -e 's|:$||')
+    fi
+    
     if command -v uv &> /dev/null; then
         echo "   Using uv (faster installation)"
-        uv pip install playwright aiohttp rich --quiet
+        uv pip install --python python3 --system playwright aiohttp rich --quiet 2>/dev/null || pip install playwright aiohttp rich --quiet
     else
-        pip install playwright aiohttp rich --quiet
+        pip install --user playwright aiohttp rich --quiet
     fi
     
     echo ""
     echo "🌐 Installing Playwright browser..."
-    playwright install chromium --quiet 2>/dev/null || playwright install chromium
+    python3 -m playwright install chromium --quiet 2>/dev/null || python3 -m playwright install chromium
 else
     echo "✓ Dependencies already installed (will not be removed)"
 fi
